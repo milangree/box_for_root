@@ -188,8 +188,8 @@ _restart_core() {
   _mlog_divider
   _mlog Warning "⚡ 重启 ${bin_name} | 原因: ${reason}"
 
-  # 调用服务脚本的 restart-core 命令，该命令只重启核心，不影响监控守护和 crond
-  "${scripts_dir}/box.service" restart-core >> "${MONITOR_LOG}" 2>&1
+  # 直接传递原因参数给 box.service restart-core
+  "${scripts_dir}/box.service" restart-core "${reason}" >> "${MONITOR_LOG}" 2>&1
 
   rm -f "${NO_NET_COUNT_FILE}" "${CPU_HIGH_START_FILE}" "${RESTART_LOCK}"
   _mlog_divider
