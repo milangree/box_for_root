@@ -76,6 +76,10 @@ box_check_logs() {
           mv "${box_run}/${bin}.log" "${box_run}/${bin}.old.log"
         fi
       done
+      # 仅在完整启动（非 restart-core）时备份 monitor.log，避免打断正在运行的监控守护
+      if [ "${SKIP_MONITOR_START:-false}" != "true" ] && [ -f "${box_run}/monitor.log" ]; then
+        mv "${box_run}/monitor.log" "${box_run}/monitor.old.log"
+      fi
       log Debug "内核日志已备份 (clear_restart_log=true)"
     else
       log Debug "保留上次内核日志 (clear_restart_log=false)"
@@ -997,7 +1001,6 @@ case "$1" in
     fi
     ;;
   restart-core)
-    # 允许传入原因参数，例如：box.service restart-core "手动重启"
     local reason=""
     if [ -n "$2" ]; then
       reason="$2"
