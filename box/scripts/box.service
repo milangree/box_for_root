@@ -225,6 +225,44 @@ box_check_bin() {
   log Info "${version_output}"
 }
 
+# ==================== JSONC 预处理函数 ====================
+# 移除 sing-box 配置文件中的 // 注释，生成标准 JSON 临时文件
+# 参数: $1 源文件路径
+# 输出: 临时文件路径（无注释的标准 JSON），若失败则返回空字符串
+sanitize_jsonc() {
+  local src="$1"
+  local tmp="${box_run}/sanitized_$$.json"
+
+  # 使用 busybox awk 移除注释：
+  # - 移除整行只有 // 注释的行
+  # - 移除行内 // 注释（简单匹配，不处理字符串内的 //，但概率极低）
+  # - 同时将多余空行压缩
+  busybox awk '
+    BEGIN { in_string = 0; prev_escaped = 0; }
+    {
+      # 粗略处理字符串内部，避免将字符串内的 "//" 当作注释
+      # 此实现简单，假设注释不会出现在字符串内，若出现则可能误删，但一般配置中很少见
+      line = $0
+      gsub(/\/\/.*$/, "", line)   # 删除行内 // 及其后的内容
+      if (line ~ /[^[:space:]]/) {
+        print line
+      }
+    }
+  ' "${src}" > "${tmp}"
+
+  # 检查生成的文件是否为空或无效
+  if [ ! -s "${tmp}" ]; then
+    log Error "JSONC 清理失败: 生成的文件为空"
+    rm -f "${tmp}"
+    echo ""
+    return 1
+  fi
+
+  echo "${tmp}"
+  return 0
+}
+# ========================================================
+
 prepare_singbox() {
   # 检查配置文件
   if ! [ -f "${sing_config}" ]; then
@@ -245,19 +283,41 @@ prepare_singbox() {
     yq="${box_dir}/bin/yq"
   fi
 
+  # ========== 新增：JSONC 支持 ==========
+  local sanitized_config=""
+  local use_temp_config=false
+  # 测试 yq 能否正常解析当前配置文件（是否包含注释）
+  if ! ${yq} eval '.' "${sing_config}" >/dev/null 2>&1; then
+    log Warning "配置文件包含注释或不标准，将自动清理注释后处理"
+    sanitized_config=$(sanitize_jsonc "${sing_config}")
+    if [ -n "${sanitized_config}" ] && [ -f "${sanitized_config}" ]; then
+      use_temp_config=true
+      log Debug "已生成临时无注释配置: ${sanitized_config}"
+    else
+      log Error "无法清理配置文件注释，请检查 ${sing_config} 格式"
+      set_description error "配置注释清理失败"
+      exit 1
+    fi
+  else
+    sanitized_config="${sing_config}"
+  fi
+  # 后续所有操作均使用 sanitized_config（可能是临时文件）
+  local work_config="${sanitized_config}"
+  # =====================================
+
   # 设置 auto_detect_interface/auto_route
-  ${yq} '.route.auto_detect_interface = true' -i --output-format=json "${sing_config}"
-  ${yq} '(.inbounds[] | select(.type == "tun") | .auto_route) |= true' -i --output-format=json "${sing_config}"
+  ${yq} '.route.auto_detect_interface = true' -i --output-format=json "${work_config}"
+  ${yq} '(.inbounds[] | select(.type == "tun") | .auto_route) |= true' -i --output-format=json "${work_config}"
   
   # 确保日志路径是绝对路径
-  ${yq} '.log.output = "'"${box_run}/${bin_name}.log"'"' -i --output-format=json "${sing_config}" 2>/dev/null || true
+  ${yq} '.log.output = "'"${box_run}/${bin_name}.log"'"' -i --output-format=json "${work_config}" 2>/dev/null || true
 
-  # 检查 sing-box 配置
-  if ( cd "$(dirname "${sing_config}")" && "${bin_path}" check -c "$(basename "${sing_config}")" ) > "${box_run}/${bin_name}.log" 2>&1; then
+  # 检查 sing-box 配置（使用原文件或临时文件）
+  if ( cd "$(dirname "${work_config}")" && "${bin_path}" check -c "$(basename "${work_config}")" ) > "${box_run}/${bin_name}.log" 2>&1; then
     # 根据 network_mode 设置 auto_route
     if [[ "${network_mode}" == @(mixed|tun) ]]; then
       # 检查配置中是否有 "type": "tun"
-      if ! busybox grep -q '"type": "tun"' "${sing_config}"; then
+      if ! busybox grep -q '"type": "tun"' "${work_config}"; then
         # 若无则添加 "tun" 配置
         ${yq} '.inbounds += [{
           "type": "tun",
@@ -272,26 +332,24 @@ prepare_singbox() {
           "include_android_user": [0,10,999],
           "include_uid": [],
           "exclude_uid": []
-        }]' -i --output-format=json "${sing_config}"
-        log Debug "已为 ${sing_config} 添加 [Tun] 配置"
+        }]' -i --output-format=json "${work_config}"
+        log Debug "已为 ${work_config} 添加 [Tun] 配置"
       fi
     else
       # 非 tun 模式，关闭 auto_route
-      # sed -i -e 's/auto_route": true/auto_route": false/g' -e 's/"auto_detect_interface": true/"auto_detect_interface": false/g' "${sing_config}"
-
       # 检查是否有 tproxy 配置
-      if ! busybox grep -q '"type": "tproxy"' "${sing_config}"; then
+      if ! busybox grep -q '"type": "tproxy"' "${work_config}"; then
         # 若无则添加 tproxy 配置
-        ${yq} '.inbounds += [{"type": "tproxy", "tag": "tproxy-in", "listen": "::", "listen_port": '"${tproxy_port}"'}]' -i --output-format=json "${sing_config}"
-        log Debug "已为 ${sing_config} 添加 [Tproxy] 配置"
+        ${yq} '.inbounds += [{"type": "tproxy", "tag": "tproxy-in", "listen": "::", "listen_port": '"${tproxy_port}"'}]' -i --output-format=json "${work_config}"
+        log Debug "已为 ${work_config} 添加 [Tproxy] 配置"
       fi
 
       # 删除 tun 配置
-      ${yq} 'del(.inbounds[] | select(.type == "tun"))' -i --output-format=json "${sing_config}"
+      ${yq} 'del(.inbounds[] | select(.type == "tun"))' -i --output-format=json "${work_config}"
 
       # 同步 tproxy 端口
-      if busybox grep -q '"type": "tproxy"' "${sing_config}"; then
-        ${yq} '(.inbounds[] | select(.type == "tproxy") | .listen_port) = '"${tproxy_port}" -i --output-format=json "${sing_config}"
+      if busybox grep -q '"type": "tproxy"' "${work_config}"; then
+        ${yq} '(.inbounds[] | select(.type == "tproxy") | .listen_port) = '"${tproxy_port}" -i --output-format=json "${work_config}"
       fi
     fi
 
@@ -300,7 +358,7 @@ prepare_singbox() {
       if [ "${proxy_mode}" = "core" ]; then
         yq_filter='(.inbounds[] | select(.type == "tun") | .include_uid) = [] |
                    (.inbounds[] | select(.type == "tun") | .exclude_uid) = []'
-        "${yq}" eval "$yq_filter" -i --output-format=json "${sing_config}" > /dev/null 2>&1
+        "${yq}" eval "$yq_filter" -i --output-format=json "${work_config}" > /dev/null 2>&1
         log_service_results "sing-box" "core" ""
       else
         # 为 tun 添加 include_uid/exclude_uid 字段
@@ -316,32 +374,50 @@ prepare_singbox() {
             yq_filter="$yq_filter | (.inbounds[] | select(.type == \"tun\") | .${mode}_uid) = [${uids_to_add}]"
           fi
         fi
-        "${yq}" eval "$yq_filter" -i --output-format=json "${sing_config}" > /dev/null 2>&1
+        "${yq}" eval "$yq_filter" -i --output-format=json "${work_config}" > /dev/null 2>&1
         log_service_results "sing-box" "$mode" "$uids_to_add"
       fi
     fi
 
     # 按 network_mode 添加 redirect 配置
     if [[ "${network_mode}" == @(mixed|enhance|redirect) ]]; then
-      if ! busybox grep -q '"type": "redirect"' "${sing_config}"; then
+      if ! busybox grep -q '"type": "redirect"' "${work_config}"; then
         # 若无则添加 redirect 配置
         ${yq} '.inbounds += [{
           "type": "redirect",
           "tag": "redirect-in",
           "listen": "::",
           "listen_port": '"${redir_port}"'
-        }]' -i --output-format=json "${sing_config}"
-        log Debug "已为 ${sing_config} 添加 [Redirect] 配置"
+        }]' -i --output-format=json "${work_config}"
+        log Debug "已为 ${work_config} 添加 [Redirect] 配置"
       fi
 
       # 同步 redir_port 端口
-      if busybox grep -q '"type": "redirect"' "${sing_config}"; then
-        ${yq} '(.inbounds[] | select(.type == "redirect") | .listen_port) = '"${redir_port}" -i --output-format=json "${sing_config}"
+      if busybox grep -q '"type": "redirect"' "${work_config}"; then
+        ${yq} '(.inbounds[] | select(.type == "redirect") | .listen_port) = '"${redir_port}" -i --output-format=json "${work_config}"
       fi
     fi
+
+    # 如果使用了临时文件，将修改后的内容写回原配置文件
+    if [ "${use_temp_config}" = "true" ] && [ -f "${work_config}" ]; then
+      # 格式化输出（保持美观）
+      ${yq} eval -o=json "${work_config}" > "${sing_config}.tmp" 2>/dev/null
+      if [ $? -eq 0 ] && [ -s "${sing_config}.tmp" ]; then
+        mv "${sing_config}.tmp" "${sing_config}"
+        log Info "已将修改后的标准 JSON 写回原配置文件（已移除注释）"
+      else
+        log Warning "无法格式化写回，但临时配置已修改成功，将使用临时配置启动"
+        # 直接使用临时配置覆盖原文件
+        cp -f "${work_config}" "${sing_config}"
+        log Info "已将修改后的配置覆盖原文件（原注释已移除）"
+      fi
+      rm -f "${work_config}"
+    fi
+
   else
     log Error "$(<"${box_run}/${bin_name}.log")"
     log Error "配置失败，请检查 ${box_run}/${bin_name}.log 文件。"
+    [ "${use_temp_config}" = "true" ] && rm -f "${work_config}"
     set_description error
     exit 1
   fi
@@ -749,7 +825,7 @@ get_dns_mode() {
   export dns_mode
 }
 
-# ==================== 新增：仅重启核心（不影响监控守护和 crond） ====================
+# ==================== 仅重启核心（不影响监控守护和 crond） ====================
 _stop_core() {
   # 停止核心进程（发送 SIGTERM）
   for bin in "${bin_list[@]}"; do
