@@ -4,7 +4,7 @@ scripts_dir="${0%/*}"
 source /data/adb/box/settings.ini
 
 PROPFILE="/data/adb/modules/box_for_root/module.prop"
-RESTART_LOG="${box_run_state}/restart.log"      # 独立重启日志
+RESTART_LOG="${box_run}/restart.log"      # 与内核日志同目录
 
 find_packages_uid() {
   if [ "${proxy_mode}" = "core" ]; then
@@ -998,7 +998,15 @@ case "$1" in
     ;;
   restart-core)
     # 允许传入原因参数，例如：box.service restart-core "手动重启"
-    restart_core_only "${2:-手动执行 restart-core}"
+    local reason=""
+    if [ -n "$2" ]; then
+      reason="$2"
+    elif [ -f "${box_run_state}/restart_reason" ]; then
+      reason=$(head -n1 "${box_run_state}/restart_reason" 2>/dev/null)
+      rm -f "${box_run_state}/restart_reason"
+    fi
+    [ -z "$reason" ] && reason="手动执行 restart-core"
+    restart_core_only "$reason"
     ;;
   status)
     # 检查服务是否在运行
